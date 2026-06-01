@@ -2,18 +2,17 @@
 //! DPS310 embedded-hal I2C driver crate
 //!
 //! A platform agnostic driver to interface with the DSP310 barometric pressure & temp sensor.
-//! This driver uses I2C via [embedded-hal]. Note that the DSP310 also supports SPI, however that
+//! This driver uses I2C via [embedded-hal-async]. Note that the DSP310 also supports SPI, however that
 //! is not (yet) implemented in this driver.
 //!
-//! [embedded-hal]: https://docs.rs/embedded-hal
+//! [embedded-hal-async]: https://docs.rs/embedded-hal-async
 
 #![no_std]
 
 mod config;
 mod register;
 
-use embedded_hal as hal;
-use hal::blocking::i2c;
+use embedded_hal_async::i2c::I2c;
 
 pub use config::*;
 pub use register::Register;
@@ -77,9 +76,9 @@ pub struct DPS310<I2C> {
 
 impl<I2C, I2CError> DPS310<I2C>
 where
-    I2C: i2c::WriteRead<Error = I2CError> + i2c::Write<Error = I2CError>,
+    I2C: I2c<Error = I2CError>,
 {
-    pub fn new(i2c: I2C, address: u8, config: &Config) -> Result<Self, Error<I2CError>> {
+    pub async fn new(i2c: I2C, address: u8, config: &Config) -> Result<Self, Error<I2CError>> {
         let mut dsp310 = Self {
             i2c,
             address,
@@ -90,36 +89,36 @@ where
 
         // dsp310.reset().ok();
 
-        let id: u8 = dsp310.get_product_id()?;
+        let id: u8 = dsp310.get_product_id().await?;
         if id != PRODUCT_ID {}
 
-        dsp310.apply_config(config)?;
-        dsp310.standby().ok();
+        dsp310.apply_config(config).await?;
+        dsp310.standby().await.ok();
 
         Ok(dsp310)
     }
 
-    fn apply_config(&mut self, config: &Config) -> Result<(), Error<I2CError>> {
+    async fn apply_config(&mut self, config: &Config) -> Result<(), Error<I2CError>> {
         // Sec 8.3 PRS_CFG register bits, PM_RATE & PM_PRC fields
-        let prs_cfg = self.read_reg(Register::PRS_CFG)?;
+        let prs_cfg = self.read_reg(Register::PRS_CFG).await?;
 
         // keep first bit from current pressure config as that is reserved
         let new_prs_cfg = (prs_cfg >> 7) << 7
             | ((config.pres_rate.unwrap_or_default() as u8) << 4)
             | (config.pres_res.unwrap_or_default() as u8);
 
-        self.write_reg(Register::PRS_CFG, new_prs_cfg)?;
+        self.write_reg(Register::PRS_CFG, new_prs_cfg).await?;
 
         // Sec 8.4 Temperature Configuration (TMP_CFG), p.31 / Sec 8.11
 
         let temp_rate = config.temp_rate.unwrap_or_default() as u8;
         let pressure_rate = config.pres_rate.unwrap_or_default() as u8;
-        let mut tmp_ext = self.read_reg(Register::TMP_COEF_SRCE)?;
+        let mut tmp_ext = self.read_reg(Register::TMP_COEF_SRCE).await?;
 
         tmp_ext = (tmp_ext >> 7) << 7;
         tmp_ext |= temp_rate << 4 | (config.temp_res.unwrap_or_default() as u8);
 
-        self.write_reg(Register::TEMP_CFG, tmp_ext)?;
+        self.write_reg(Register::TEMP_CFG, tmp_ext).await?;
 
         // if sampling rate > 8, must set the shift bit
         let shift_bit =
@@ -135,32 +134,32 @@ where
             | ((config.fifo_enable as u8) << 1)
             | ((config.spi_mode as u8) << 0);
 
-        self.write_reg(Register::CFG_REG, cfg)?;
+        self.write_reg(Register::CFG_REG, cfg).await?;
 
         Ok(())
     }
 
     /// Set measurement mode to `idle`
-    fn standby(&mut self) -> Result<(), Error<I2CError>> {
-        self.write_reg(Register::MEAS_CFG, 0)
+    async fn standby(&mut self) -> Result<(), Error<I2CError>> {
+        self.write_reg(Register::MEAS_CFG, 0).await
     }
 
     /// Read status bits from MEAS_CFG reg.
     /// MEAS_CFG register is masked with 0xF0
-    pub fn read_status(&mut self) -> Result<u8, Error<I2CError>> {
-        let meas_cfg = self.read_reg(Register::MEAS_CFG)?;
+    pub async fn read_status(&mut self) -> Result<u8, Error<I2CError>> {
+        let meas_cfg = self.read_reg(Register::MEAS_CFG).await?;
         Ok(meas_cfg & 0xF0)
     }
 
     /// Returns the product ID from PROD_ID register.
     /// This value is expected to be 0x1D
-    pub fn get_product_id(&mut self) -> Result<u8, Error<I2CError>> {
+    pub async fn get_product_id(&mut self) -> Result<u8, Error<I2CError>> {
         // TODO: Make sure that both revision ID and product ID is supported. Sec 8.10
-        self.read_reg(Register::PROD_ID)
+        self.read_reg(Register::PROD_ID).await
     }
 
     /// Start a single or continuous measurement for `pres`sure or `temp`erature
-    pub fn trigger_measurement(
+    pub async fn trigger_measurement(
         &mut self,
         temp: bool,
         pres: bool,
@@ -172,66 +171,67 @@ where
         }
         // See section 8.5, MEAS_CTRL field description in manual
 
-        let mut meas_cfg: u8 = self.read_reg(Register::MEAS_CFG)?;
+        let mut meas_cfg: u8 = self.read_reg(Register::MEAS_CFG).await?;
         meas_cfg = (meas_cfg >> 3) << 3; // reset last 3 bits
         meas_cfg |= (continuous as u8) << 2 | (temp as u8) << 1 | pres as u8;
 
-        self.write_reg(Register::MEAS_CFG, meas_cfg)
+        self.write_reg(Register::MEAS_CFG, meas_cfg).await
     }
 
     /// Returns true if sensor coeficients are available
-    pub fn coef_ready(&mut self) -> Result<bool, Error<I2CError>> {
+    pub async fn coef_ready(&mut self) -> Result<bool, Error<I2CError>> {
         // see  sec 8.5, MEAS_CFG, COEF_RDY field (bit 7)
-        let status = self.read_status()?;
+        let status = self.read_status().await?;
         Ok((status & (1 << 7)) != 0)
     }
 
     /// Returns true if sensor initialized and ready to take measurements
-    pub fn init_complete(&mut self) -> Result<bool, Error<I2CError>> {
+    pub async fn init_complete(&mut self) -> Result<bool, Error<I2CError>> {
         // see  sec 8.5, MEAS_CFG, SENSOR_RDY field (bit 6)
-        let status = self.read_status()?;
+        let status = self.read_status().await?;
         Ok((status & (1 << 6)) != 0)
     }
 
     /// Returns true if temperature measurement is ready
-    pub fn temp_ready(&mut self) -> Result<bool, Error<I2CError>> {
+    pub async fn temp_ready(&mut self) -> Result<bool, Error<I2CError>> {
         // See sec 8.5 TMP_RDY field
-        let status = self.read_status()?;
+        let status = self.read_status().await?;
         Ok((status & (1 << 5)) != 0)
     }
 
     /// Returns true if pressure measurement is ready
-    pub fn pres_ready(&mut self) -> Result<bool, Error<I2CError>> {
+    pub async fn pres_ready(&mut self) -> Result<bool, Error<I2CError>> {
         // See sec 8.5 PRS_RDY field
-        let status = self.read_status()?;
+        let status = self.read_status().await?;
         Ok((status & (1 << 4)) != 0)
     }
 
     /// Read raw temperature contents
-    fn read_temp_raw(&mut self) -> Result<i32, Error<I2CError>> {
+    async fn read_temp_raw(&mut self) -> Result<i32, Error<I2CError>> {
         let mut bytes: [u8; 3] = [0, 0, 0];
         self.i2c
-            .write_read(self.address, &[Register::TMP_B2.addr()], &mut bytes)?;
+            .write_read(self.address, &[Register::TMP_B2.addr()], &mut bytes)
+            .await?;
         let temp = ((bytes[0] as u32) << 16) | ((bytes[1] as u32) << 8) | (bytes[2] as u32);
-        let temp = self.get_twos_complement(temp, 24);
+        let temp = Self::get_twos_complement(temp, 24);
 
         Ok(temp)
     }
 
     /// See section 4.9.2:
-    fn read_temp_scaled(&mut self) -> Result<f32, Error<I2CError>> {
-        let raw_sc: f32 = self.read_temp_raw()? as f32 / self.temp_res.get_kt_value();
+    async fn read_temp_scaled(&mut self) -> Result<f32, Error<I2CError>> {
+        let raw_sc: f32 = self.read_temp_raw().await? as f32 / self.temp_res.get_kt_value();
         Ok(raw_sc)
     }
 
     /// Read calibrated temperature data in degrees Celsius.
-    /// 
+    ///
     /// This method uses the pre calculated constants based on the calibration coefficients
     /// which have to be initialized with [Self::read_calibration_coefficients()] beforehand.
-    /// 
+    ///
     /// See section 4.9.2 in the datasheet (formula), Sec 8.11 (coefficients)
-    pub fn read_temp_calibrated(&mut self) -> Result<f32, Error<I2CError>> {
-        let scaled = self.read_temp_scaled();
+    pub async fn read_temp_calibrated(&mut self) -> Result<f32, Error<I2CError>> {
+        let scaled = self.read_temp_scaled().await;
         match scaled {
             Ok(raw_sc) => Ok((self.coeffs.C0 as f32 * 0.5) + (self.coeffs.C1 as f32 * raw_sc)),
             Err(err) => Err(err),
@@ -239,10 +239,11 @@ where
     }
 
     /// Read raw pressure contents
-    pub fn read_pressure_raw(&mut self) -> Result<i32, Error<I2CError>> {
+    pub async fn read_pressure_raw(&mut self) -> Result<i32, Error<I2CError>> {
         let mut bytes: [u8; 3] = [0, 0, 0];
         self.i2c
-            .write_read(self.address, &[Register::PSR_B2.addr()], &mut bytes)?;
+            .write_read(self.address, &[Register::PSR_B2.addr()], &mut bytes)
+            .await?;
 
         let pressure: i32 =
             (((bytes[0] as i32) << 24) | ((bytes[1] as i32) << 16) | (bytes[2] as i32) << 8) >> 8;
@@ -250,8 +251,8 @@ where
         Ok(pressure)
     }
 
-    fn read_pressure_scaled(&mut self) -> Result<f32, Error<I2CError>> {
-        let pres_raw = self.read_pressure_raw()?;
+    async fn read_pressure_scaled(&mut self) -> Result<f32, Error<I2CError>> {
+        let pres_raw = self.read_pressure_raw().await?;
         let k_p = self.pres_res.get_kP_value();
         let pres_scaled = pres_raw as f32 / k_p;
 
@@ -259,15 +260,15 @@ where
     }
 
     /// Read calibrated pressure data in Pa.
-    /// 
+    ///
     /// This method uses the pre calculated constants based on the calibration coefficients
     /// which have to be initialized with [Self::read_calibration_coefficients()] beforehand.
-    /// 
+    ///
     /// See section 8.11 in the datasheet.
     /// See section 4.9.1 for calculation method.
-    pub fn read_pressure_calibrated(&mut self) -> Result<f32, Error<I2CError>> {
-        let pres_scaled = self.read_pressure_scaled()?;
-        let temp_scaled = self.read_temp_scaled()?;
+    pub async fn read_pressure_calibrated(&mut self) -> Result<f32, Error<I2CError>> {
+        let pres_scaled = self.read_pressure_scaled().await?;
+        let temp_scaled = self.read_temp_scaled().await?;
 
         let pres_cal = (self.coeffs.C00 as f32)
             + (pres_scaled
@@ -283,38 +284,40 @@ where
     }
 
     /// Issue a full reset and fifo flush
-    pub fn reset(&mut self) -> Result<(), Error<I2CError>> {
-        self.write_reg(Register::RESET, 0b10001001)
+    pub async fn reset(&mut self) -> Result<(), Error<I2CError>> {
+        self.write_reg(Register::RESET, 0b10001001).await
     }
 
-    fn write_reg(&mut self, reg: Register, value: u8) -> Result<(), Error<I2CError>> {
+    async fn write_reg(&mut self, reg: Register, value: u8) -> Result<(), Error<I2CError>> {
         let bytes = [reg.addr(), value];
-        self.i2c.write(self.address, &bytes)?;
+        self.i2c.write(self.address, &bytes).await?;
         Ok(())
     }
 
-    fn read_reg(&mut self, reg: Register) -> Result<u8, Error<I2CError>> {
+    async fn read_reg(&mut self, reg: Register) -> Result<u8, Error<I2CError>> {
         let mut buffer: [u8; 1] = [0];
         self.i2c
-            .write_read(self.address, &[reg.addr()], &mut buffer)?;
+            .write_read(self.address, &[reg.addr()], &mut buffer)
+            .await?;
         Ok(buffer[0])
     }
 
     /// Read calibration coefficients. User must wait for `Self::coef_ready()` to return true before reading coefficients.
     ///
     /// Taken from official Arduino library, see <https://github.com/Infineon/DPS310-Pressure-Sensor/blob/888200c7efd8edb19ce69a2144e28ba31cdad449/src/Dps310.cpp#L89>
-    /// 
+    ///
     /// See Sec 8.11
-    pub fn read_calibration_coefficients(&mut self) -> Result<(), Error<I2CError>> {
+    pub async fn read_calibration_coefficients(&mut self) -> Result<(), Error<I2CError>> {
         let mut bytes: [u8; 18] = [0; 18];
 
         self.i2c
-            .write_read(self.address, &[Register::COEFF_REG_1.addr()], &mut bytes)?;
+            .write_read(self.address, &[Register::COEFF_REG_1.addr()], &mut bytes)
+            .await?;
 
         let _c0 = ((bytes[0] as u32) << 4) | (((bytes[1] as u32) >> 4) & 0x0F);
 
         // C0 12bits 2's complement
-        self.coeffs.C0 = self.get_twos_complement(
+        self.coeffs.C0 = Self::get_twos_complement(
             ((bytes[0] as u32) << 4) | (((bytes[1] as u32) >> 4) & 0x0F),
             12,
         );
@@ -322,14 +325,14 @@ where
         let _c1 = (((bytes[1] as u32) & 0x0F) << 8) | (bytes[2] as u32);
         // C1 12bits 2's complement
         self.coeffs.C1 =
-            self.get_twos_complement((((bytes[1] as u32) & 0x0F) << 8) | (bytes[2] as u32), 12);
+            Self::get_twos_complement((((bytes[1] as u32) & 0x0F) << 8) | (bytes[2] as u32), 12);
 
         let _c00 = ((bytes[3] as u32) << 12)
             | ((bytes[4] as u32) << 4)
             | (((bytes[5] as u32) >> 4) & 0x0F);
 
         // C00 20bits 2's complement
-        self.coeffs.C00 = self.get_twos_complement(
+        self.coeffs.C00 = Self::get_twos_complement(
             ((bytes[3] as u32) << 12)
                 | ((bytes[4] as u32) << 4)
                 | (((bytes[5] as u32) >> 4) & 0x0F),
@@ -339,7 +342,7 @@ where
         let _c10 =
             (((bytes[5] as u32) & 0x0F) << 16) | ((bytes[6] as u32) << 8) | (bytes[7] as u32);
         // C10 20bits 2's complement
-        self.coeffs.C10 = self.get_twos_complement(
+        self.coeffs.C10 = Self::get_twos_complement(
             (((bytes[5] as u32) & 0x0F) << 16) | ((bytes[6] as u32) << 8) | (bytes[7] as u32),
             20,
         );
@@ -348,36 +351,36 @@ where
 
         // C01 16bits 2's complement
         self.coeffs.C01 =
-            self.get_twos_complement(((bytes[8] as u32) << 8) | (bytes[9] as u32), 16);
+            Self::get_twos_complement(((bytes[8] as u32) << 8) | (bytes[9] as u32), 16);
 
         let _c11 = ((bytes[10] as u32) << 8) | (bytes[11] as u32);
 
         // C11 16bits 2's complement
         self.coeffs.C11 =
-            self.get_twos_complement(((bytes[10] as u32) << 8) | (bytes[11] as u32), 16);
+            Self::get_twos_complement(((bytes[10] as u32) << 8) | (bytes[11] as u32), 16);
 
         let _c20 = ((bytes[12] as u32) << 8) | (bytes[13] as u32);
 
         // C20 16bits 2's complement
         self.coeffs.C20 =
-            self.get_twos_complement(((bytes[12] as u32) << 8) | (bytes[13] as u32), 16);
+            Self::get_twos_complement(((bytes[12] as u32) << 8) | (bytes[13] as u32), 16);
 
         let _c21 = ((bytes[14] as u32) << 8) | (bytes[15] as u32);
 
         // C21 16bits 2's complement
         self.coeffs.C21 =
-            self.get_twos_complement(((bytes[14] as u32) << 8) | (bytes[15] as u32), 16);
+            Self::get_twos_complement(((bytes[14] as u32) << 8) | (bytes[15] as u32), 16);
 
         let _c30 = ((bytes[16] as u32) << 8) | (bytes[17] as u32);
 
         // C30 16bits 2's complement
         self.coeffs.C30 =
-            self.get_twos_complement(((bytes[16] as u32) << 8) | (bytes[17] as u32), 16);
+            Self::get_twos_complement(((bytes[16] as u32) << 8) | (bytes[17] as u32), 16);
 
         Ok(())
     }
 
-    fn get_twos_complement(&self, val: u32, length: u8) -> i32 {
+    fn get_twos_complement(val: u32, length: u8) -> i32 {
         let mut ret = val as i32;
         if (val & ((1 as u32) << (length - 1))) > 0 {
             ret -= ((1 as u32) << length) as i32;
